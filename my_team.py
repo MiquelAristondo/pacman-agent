@@ -53,6 +53,20 @@ class ReflexCaptureAgent(CaptureAgent):
     def register_initial_state(self, game_state):
         self.start = game_state.get_agent_position(self.index)
         CaptureAgent.register_initial_state(self, game_state)
+  
+        # afegim quina es la frontera del nostre camp ja que ho necessitarem
+        walls = game_state.get_walls()
+        mig = walls.width // 2
+        if self.red:
+            limit_x = mig - 1
+        else:
+            limit_x = mig
+        self.boundary = []
+        for y in range(walls.height):
+            if not walls[limit_x][y]:
+                self.boundary.append((limit_x, y))
+
+
 
     def choose_action(self, game_state):
         """
@@ -104,6 +118,24 @@ class ReflexCaptureAgent(CaptureAgent):
         weights = self.get_weights(game_state, action)
         return features * weights
 
+    # funció per saber la distancia a la que estam d'arribar al nostre camp
+    def distance_to_home(self, pos):
+        min_dist = 9999
+        for cell in self.boundary:
+            d = self.get_maze_distance(pos, cell)
+            if d < min_dist:
+                min_dist = d
+        return min_dist
+
+    # funció per saber si tenim rivals aprop
+    def visible_enemies(self, game_state):
+        enemies = []
+        for i in self.get_opponents(game_state):
+            state = game_state.get_agent_state(i)
+            if state.get_position() is not None: # si estan enfora el get_position() retorna None
+                enemies.append(state)
+        return enemies
+    
     def get_features(self, game_state, action):
         """
         Returns a counter of features for the state
@@ -140,10 +172,69 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
             my_pos = successor.get_agent_state(self.index).get_position()
             min_distance = min([self.get_maze_distance(my_pos, food) for food in food_list])
             features['distance_to_food'] = min_distance
+        
+        # informació de després de fer l'acció
+        my_state = successor.get_agent_state(self.index)
+        my_pos = my_state.get_position()
+        carrying = my_state.num_carrying   # peces de menjar que duim
+
+        # si l'score puja és que travessam la frontera (ho incentivam)
+        features['punts'] = self.get_score(successor)
+
+        # miram quin enemic visible que sigui perillós (no estigui espantat o li quedi poc) tenim més a prop
+        ghost_dist = 9999
+        for enemy in self.visible_enemies(successor):
+            if not enemy.is_pacman and enemy.scared_timer <= 2:
+                d = self.get_maze_distance(my_pos, enemy.get_position())
+                if d < ghost_dist:
+                    ghost_dist = d
+
+        # tornam a casa si es cumpleix alguna d'aquestes condicions
+        time_left = game_state.data.timeleft
+        go_home = (carrying >= 5
+                   or len(food_list) <= 2
+                   or (carrying > 0 and time_left < 4 * (self.distance_to_home(my_pos) + 10))
+                   or (carrying > 0 and ghost_dist <= 5))
+        if go_home:
+            # ja no buscam menjar i anem cap al nostre camp
+            features['distance_to_food'] = 0
+            features['dist_camp'] = self.distance_to_home(my_pos)
+
+        # penalitzam acostar-mos als fantasmes
+        if my_state.is_pacman and ghost_dist <= 5:
+            features['dist_ghost'] = 1.0 / max(ghost_dist, 1)
+            if ghost_dist <= 1:
+                features['ghost_aferrat'] = 1
+
+        # si després de l'acció som a la posició inicial i abans no hi erem es que ens han menjat
+        if my_pos == self.start and game_state.get_agent_position(self.index) != self.start:
+            features['mort'] = 1
+
+        # si tenim un fantasma a prop i hi ha alguna capsula a prop anirem a buscar la per poder menjar o fugir del fantasma
+        capsules = self.get_capsules(successor)
+        if len(capsules) > 0 and ghost_dist <= 5:
+            min_cap = 9999
+            for cap in capsules:
+                d = self.get_maze_distance(my_pos, cap)
+                if d < min_cap:
+                    min_cap = d
+            features['dist_capsula'] = min_cap
+
+        # penalitzem no mourer-se i tornar cap enrere perquè l'agent no quedi en bucle 
+        if action == Directions.STOP:
+            features['stop'] = 1
+        anar_enrere = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
+        if action == anar_enrere:
+            features['enrere'] = 1
+
         return features
 
     def get_weights(self, game_state, action):
-        return {'successor_score': 100, 'distance_to_food': -1}
+        return {'successor_score': 100, 'distance_to_food': -2,
+                # pesos de les features que hem afegit
+                'punts': 100, 'dist_camp': -5, 'dist_ghost': -50,
+                'ghost_aferrat': -1000, 'mort': -1000, 'dist_capsula': -3,
+                'stop': -100, 'enrere': -2}
 
 
 class DefensiveReflexAgent(ReflexCaptureAgent):
@@ -154,8 +245,23 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
     such an agent.
     """
 
+    # guardam alla on mengen per darrera vegada
+    def __init__(self, index, time_for_computing=.1):
+        super().__init__(index, time_for_computing)
+        self.last_eaten = None
+
     def get_features(self, game_state, action):
         features = util.Counter()
+    
+        # si mos han menjat significa que hi ha un pacman a prop d'allà
+        previous = self.get_previous_observation()
+        if previous is not None: # si no te previa es que es el primer torn i no hi ha res amb que comparar
+            menjar_abans = set(self.get_food_you_are_defending(previous).as_list())
+            menjar_despres = set(self.get_food_you_are_defending(game_state).as_list())
+            menjat = menjar_abans - menjar_despres
+            if len(menjat) > 0:
+                self.last_eaten = list(menjat)[0]
+
         successor = self.get_successor(game_state, action)
 
         my_state = successor.get_agent_state(self.index)
@@ -173,6 +279,28 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
             dists = [self.get_maze_distance(my_pos, a.get_position()) for a in invaders]
             features['invader_distance'] = min(dists)
 
+            # si estam scared ens poden menjar per tant ja no ens apropam als pacman
+            # ens mantenim a 2 caselles per menjar-lo quan ja poguem
+            if my_state.scared_timer > 0:
+                features['invader_distance'] = 0
+                features['dist_quan_scared'] = abs(min(dists) - 2)
+        else:
+            # si no veim invasors anem cap a on ens han agafat menjar i si no han menjat anem cap al centre del taulell
+            if self.last_eaten is not None and my_pos != self.last_eaten:
+                features['dist_objectiu_vigilar'] = self.get_maze_distance(my_pos, self.last_eaten)
+            else:
+                if my_pos == self.last_eaten:
+                    self.last_eaten = None   # quan ja arribam allà on haviem d'anar ja no necessitam anar cap allà
+                walls = game_state.get_walls()
+                centre = self.boundary[0]
+                best = 9999
+                for cell in self.boundary:
+                    d = abs(cell[1] - walls.height // 2)
+                    if d < best:
+                        best = d
+                        centre = cell
+                features['dist_objectiu_vigilar'] = self.get_maze_distance(my_pos, centre)
+
         if action == Directions.STOP: features['stop'] = 1
         rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
         if action == rev: features['reverse'] = 1
@@ -180,4 +308,6 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
         return features
 
     def get_weights(self, game_state, action):
-        return {'num_invaders': -1000, 'on_defense': 100, 'invader_distance': -10, 'stop': -100, 'reverse': -2}
+                return {'num_invaders': -1000, 'on_defense': 100, 'invader_distance': -10, 'stop': -100, 'reverse': -2,
+                # pesos de les features afegides
+                'dist_quan_scared': -10, 'dist_objectiu_vigilar': -2}
